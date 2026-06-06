@@ -1,0 +1,79 @@
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+
+# ADLS Configuration
+spark.conf.set(
+    "fs.azure.account.key.<<storageaccountname>>.dfs.core.windows.net",
+   <<storage_account_access_key>>
+)
+
+bronze_path     = "abfss://<<container>>@<<Storage_account_name>>.dfs.core.windows.net/<<path>>"
+silver_path     = "abfss://<<container>>@<<Storage_account_name>>.dfs.core.windows.net/<<path>>"
+checkpoint_path = silver_path + "_checkpoint"
+
+bronze_df = (
+    spark.readStream
+    .format("delta")
+    .option("ignoreDeletes", "true")
+    .option("ignoreChanges", "true")
+    .load(bronze_path)
+)
+
+# Define schema
+schema = StructType([
+    StructField("patient_id",     StringType()),
+    StructField("gender",         StringType()),
+    StructField("age",            IntegerType()),
+    StructField("department",     StringType()),
+    StructField("admission_time", StringType()),
+    StructField("discharge_time", StringType()),
+    StructField("bed_id",         IntegerType()),
+    StructField("hospital_id",    IntegerType()),
+])
+
+# Parse raw JSON
+parsed_df = (
+    bronze_df
+    .withColumn("data", from_json(col("raw_json"), schema))
+    .select("data.*")
+)
+
+# ✅ FIX: Use correct ISO 8601 format with 'T' separator
+clean_df = parsed_df.withColumn(
+    "admission_time",
+    to_timestamp(col("admission_time"), "yyyy-MM-dd'T'HH:mm:ss.SSSSSS")  # ✅ Matches: 2026-06-06T13:37:06.739206
+)
+clean_df = clean_df.withColumn(
+    "discharge_time",
+    to_timestamp(col("discharge_time"), "yyyy-MM-dd'T'HH:mm:ss.SSSSSS")  # ✅ Matches: 2026-06-09T09:37:06.739206
+)
+
+# Nullify invalid admission times
+clean_df = clean_df.withColumn(
+    "admission_time",
+    when(
+        col("admission_time").isNull() | (col("admission_time") > current_timestamp()),
+        lit(None)
+    ).otherwise(col("admission_time"))
+)
+
+# Handle invalid age
+clean_df = clean_df.withColumn(
+    "age",
+    when(col("age") > 100, floor(rand() * 90 + 1).cast("int"))
+    .otherwise(col("age"))
+)
+
+# Write to silver
+query = (
+    clean_df.writeStream
+    .format("delta")
+    .outputMode("append")
+    .option("mergeSchema", "true")
+    .option("schemaEvolutionMode", "addNewColumns")
+    .option("checkpointLocation", checkpoint_path)
+    .trigger(processingTime="30 seconds")
+    .start(silver_path)
+)
+
+query.awaitTermination()

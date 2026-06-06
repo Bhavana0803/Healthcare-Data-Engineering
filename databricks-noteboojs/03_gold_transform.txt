@@ -1,0 +1,172 @@
+from pyspark.sql import functions as F
+from pyspark.sql.functions import lit, col, expr, current_timestamp, to_timestamp, sha2, concat_ws, coalesce, monotonically_increasing_id
+from delta.tables import DeltaTable
+from pyspark.sql import Window
+
+
+# ADLS Configuration
+spark.conf.set(
+    "fs.azure.account.key.<<storageaccountname>>.dfs.core.windows.net",
+   <<storage_account_access_key>>
+)
+
+
+
+# Paths
+silver_path         = "abfss://<<container>>@<<Storage_account_name>>.dfs.core.windows.net/<<path>>"
+gold_dim_patient    = "abfss://<<container>>@<<Storage_account_name>>.dfs.core.windows.net/<<path>>"
+gold_dim_department = "abfss://<<container>>@<<Storage_account_name>>.dfs.core.windows.net/<<path>>"
+gold_fact           = "abfss://<<container>>@<<Storage_account_name>>.dfs.core.windows.net/<<path>>"
+# Read silver data
+silver_df = spark.read.format("delta").load(silver_path)
+
+# Keep only latest admission per patient
+w = Window.partitionBy("patient_id").orderBy(F.col("admission_time").desc())
+silver_df = (
+    silver_df
+    .withColumn("row_num", F.row_number().over(w))
+    .filter(F.col("row_num") == 1)
+    .drop("row_num")
+)
+
+# ── Patient Dimension ────────────────────────────────────────────────
+incoming_patient = (
+    silver_df
+    .select("patient_id", "gender", "age")
+    .withColumn("effective_from", current_timestamp())
+)
+
+if not DeltaTable.isDeltaTable(spark, gold_dim_patient):
+    incoming_patient \
+        .withColumn("surrogate_key", expr("uuid()")) \
+        .withColumn("effective_to", lit(None).cast("timestamp")) \
+        .withColumn("is_current", lit(True)) \
+        .write.format("delta").mode("overwrite").save(gold_dim_patient)
+
+target_patient = DeltaTable.forPath(spark, gold_dim_patient)
+
+incoming_patient = incoming_patient.withColumn(
+    "_hash",
+    F.sha2(F.concat_ws("||", F.coalesce(col("gender"), lit("NA")), F.coalesce(col("age").cast("string"), lit("NA"))), 256)
+)
+
+target_patient_df = (
+    spark.read.format("delta").load(gold_dim_patient)
+    .withColumn(
+        "_target_hash",
+        F.sha2(F.concat_ws("||", F.coalesce(col("gender"), lit("NA")), F.coalesce(col("age").cast("string"), lit("NA"))), 256)
+    )
+    .select("surrogate_key", "patient_id", "gender", "age", "is_current", "_target_hash", "effective_from", "effective_to")
+)
+
+incoming_patient.createOrReplaceTempView("incoming_patient_tmp")
+target_patient_df.createOrReplaceTempView("target_patient_tmp")
+
+# Mark old rows as not current
+changes_df = spark.sql("""
+    SELECT t.surrogate_key, t.patient_id
+    FROM target_patient_tmp t
+    JOIN incoming_patient_tmp i ON t.patient_id = i.patient_id
+    WHERE t.is_current = true AND t._target_hash <> i._hash
+""")
+
+changed_keys = [row['surrogate_key'] for row in changes_df.collect()]
+
+if changed_keys:
+    target_patient.update(
+        condition=expr("is_current = true AND surrogate_key IN ('{}')".format("','".join([str(k) for k in changed_keys]))),
+        set={
+            "is_current": expr("false"),
+            "effective_to": expr("current_timestamp()")
+        }
+    )
+
+# Insert new/changed rows
+inserts_df = spark.sql("""
+    SELECT i.patient_id, i.gender, i.age, i.effective_from, i._hash
+    FROM incoming_patient_tmp i
+    LEFT JOIN target_patient_tmp t
+      ON i.patient_id = t.patient_id AND t.is_current = true
+    WHERE t.patient_id IS NULL OR t._target_hash <> i._hash
+""").withColumn("surrogate_key", expr("uuid()")) \
+  .withColumn("effective_to", lit(None).cast("timestamp")) \
+  .withColumn("is_current", lit(True)) \
+  .select("surrogate_key", "patient_id", "gender", "age", "effective_from", "effective_to", "is_current")
+
+if inserts_df.count() > 0:
+    inserts_df.write.format("delta").mode("append").save(gold_dim_patient)
+
+# ── Department Dimension ─────────────────────────────────────────────
+# ✅ FIX: import moved to top, withColumn chained correctly
+incoming_dept = (
+    silver_df
+    .select("department", "hospital_id")
+    .dropDuplicates(["department", "hospital_id"])
+    .withColumn("surrogate_key", expr("uuid()"))   # ✅ Fixed - chained properly
+)
+
+if not DeltaTable.isDeltaTable(spark, gold_dim_department):
+    incoming_dept.write.format("delta").mode("overwrite").save(gold_dim_department)
+else:
+    target_dept = DeltaTable.forPath(spark, gold_dim_department)
+    (
+        target_dept.alias("t").merge(
+            incoming_dept.alias("i"),
+            "t.department = i.department AND t.hospital_id = i.hospital_id"
+        )
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+# ── Fact Table ───────────────────────────────────────────────────────
+dim_patient_df = (
+    spark.read.format("delta").load(gold_dim_patient)
+    .filter(col("is_current") == True)
+    .select(col("surrogate_key").alias("surrogate_key_patient"), "patient_id", "gender", "age")
+)
+
+dim_dept_df = (
+    spark.read.format("delta").load(gold_dim_department)
+    .select(col("surrogate_key").alias("surrogate_key_dept"), "department", "hospital_id")
+)
+
+fact_base = (
+    silver_df
+    .select("patient_id", "department", "hospital_id", "admission_time", "discharge_time", "bed_id")
+    .withColumn("admission_date", F.to_date("admission_time"))
+)
+
+fact_enriched = (
+    fact_base
+    .join(dim_patient_df, on="patient_id", how="left")
+    .join(dim_dept_df, on=["department", "hospital_id"], how="left")
+)
+
+fact_enriched = (
+    fact_enriched
+    .withColumn("length_of_stay_hours",
+        (F.unix_timestamp(col("discharge_time")) - F.unix_timestamp(col("admission_time"))) / 3600.0)
+    .withColumn("is_currently_admitted",
+        F.when(col("discharge_time") > current_timestamp(), lit(True)).otherwise(lit(False)))
+    .withColumn("event_ingestion_time", current_timestamp())
+)
+
+fact_final = fact_enriched.select(
+    expr("uuid()").alias("fact_id"),               # ✅ uuid instead of monotonically_increasing_id
+    col("surrogate_key_patient").alias("patient_sk"),
+    col("surrogate_key_dept").alias("department_sk"),
+    "admission_time",
+    "discharge_time",
+    "admission_date",
+    "length_of_stay_hours",
+    "is_currently_admitted",
+    "bed_id",
+    "event_ingestion_time"
+)
+
+fact_final.write.format("delta").mode("append").save(gold_fact)
+
+# Sanity checks
+print("Patient dim count:",    spark.read.format("delta").load(gold_dim_patient).count())
+print("Department dim count:", spark.read.format("delta").load(gold_dim_department).count())
+print("Fact rows:",            spark.read.format("delta").load(gold_fact).count())
